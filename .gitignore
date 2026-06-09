@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+
+.env
+.venv/
+venv/
+
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+ocr_debug.json
+scoreboard_output.json
+scoreboard_output.csv
