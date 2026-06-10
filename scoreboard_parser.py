@@ -1,29 +1,79 @@
+import gc
+import os
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, Generator
+
+# ============================================================
+# CPU LIMITS
+# ============================================================
+# These must be set before importing PyTorch, EasyOCR, or OpenCV.
+
+CPU_THREAD_LIMIT = 2
+
+os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREAD_LIMIT))
+os.environ.setdefault("MKL_NUM_THREADS", str(CPU_THREAD_LIMIT))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(CPU_THREAD_LIMIT))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(CPU_THREAD_LIMIT))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(CPU_THREAD_LIMIT))
 
 import cv2
 import easyocr
+import torch
 
 
 # ============================================================
-# SETTINGS
+# RUNTIME CONFIGURATION
 # ============================================================
 
-# Increase this where uploaded screenshots contain very small text.
-UPSCALE_FACTOR = 2
+torch.set_num_threads(CPU_THREAD_LIMIT)
 
-# Keep this False unless PyTorch can access a supported GPU.
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # This can only be set once per process.
+    pass
+
+cv2.setNumThreads(1)
+
 USE_GPU = False
 
-# Most squads contain four players.
 EXPECTED_PLAYERS_PER_TEAM = 4
 
-# OCR occasionally reads the kill icon as a leading digit.
+# OCR occasionally reads the kill icon as a false leading 9.
 # Example: a visible 5 may be returned as 95.
 MAX_REASONABLE_KILLS = 30
+
+# Do not automatically double every screenshot.
+# Smaller images are enlarged moderately. Larger images are capped.
+TARGET_IMAGE_WIDTH = 1800
+MAX_IMAGE_WIDTH = 2000
+
+# Avoid re-reading every clear heading.
+HEADER_RETRY_CONFIDENCE_THRESHOLD = 0.90
+
+# Avoid excessive OCR passes.
+MAX_HEADER_RETRY_VARIANTS = 2
+MAX_MISSING_HEADER_RETRY_VARIANTS = 3
+MAX_PLAYER_RETRY_VARIANTS = 2
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message: str) -> None:
+    """
+    Print a timestamped parser message for Railway deployment logs.
+    """
+
+    print(
+        f"[scoreboard-parser] {message}",
+        flush=True
+    )
 
 
 # ============================================================
@@ -34,13 +84,73 @@ MAX_REASONABLE_KILLS = 30
 def get_ocr_reader() -> easyocr.Reader:
     """
     Load EasyOCR once and reuse it across API requests.
-
-    Reloading EasyOCR for every uploaded screenshot is slow.
     """
 
-    return easyocr.Reader(
+    log(
+        f"Loading EasyOCR reader. "
+        f"CPU threads={torch.get_num_threads()}, "
+        f"OpenCV threads={cv2.getNumThreads()}."
+    )
+
+    reader = easyocr.Reader(
         ["en"],
         gpu=USE_GPU
+    )
+
+    log("EasyOCR reader loaded successfully.")
+
+    return reader
+
+
+# ============================================================
+# IMAGE PREPARATION
+# ============================================================
+
+def resize_image_safely(
+    image: Any
+) -> tuple[Any, float]:
+    """
+    Resize a screenshot conservatively.
+
+    The previous parser always doubled width and height, creating
+    four times as many pixels. This version enlarges only where useful
+    and caps oversized screenshots.
+    """
+
+    original_height, original_width = image.shape[:2]
+
+    if original_width <= 0:
+        raise ValueError(
+            "The uploaded image width is invalid."
+        )
+
+    if original_width < TARGET_IMAGE_WIDTH:
+        scale_factor = (
+            TARGET_IMAGE_WIDTH
+            / original_width
+        )
+    elif original_width > MAX_IMAGE_WIDTH:
+        scale_factor = (
+            MAX_IMAGE_WIDTH
+            / original_width
+        )
+    else:
+        scale_factor = 1.0
+
+    if abs(scale_factor - 1.0) < 0.01:
+        return image, 1.0
+
+    resized_image = cv2.resize(
+        image,
+        None,
+        fx=scale_factor,
+        fy=scale_factor,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    return resized_image, round(
+        scale_factor,
+        3
     )
 
 
@@ -48,7 +158,9 @@ def get_ocr_reader() -> easyocr.Reader:
 # TEXT NORMALISATION
 # ============================================================
 
-def normalise_team_heading(raw_text: str) -> str | None:
+def normalise_team_heading(
+    raw_text: str
+) -> str | None:
     """
     Convert common OCR mistakes in team headings.
 
@@ -60,6 +172,7 @@ def normalise_team_heading(raw_text: str) -> str | None:
         TEAMT  -> TEAM7
         TEAMIO -> TEAM10
         TEAMZO -> TEAM20
+        TEAMZ4 -> TEAM24
     """
 
     cleaned_text = re.sub(
@@ -72,6 +185,9 @@ def normalise_team_heading(raw_text: str) -> str | None:
         return None
 
     suffix = cleaned_text[4:]
+
+    if suffix == "":
+        return None
 
     direct_replacements = {
         "S": "5",
@@ -97,23 +213,81 @@ def normalise_team_heading(raw_text: str) -> str | None:
     }
 
     if suffix in direct_replacements:
-        suffix = direct_replacements[suffix]
+        suffix = direct_replacements[
+            suffix
+        ]
 
-    suffix = suffix.replace("O", "0")
-    suffix = suffix.replace("D", "0")
-    suffix = suffix.replace("I", "1")
-    suffix = suffix.replace("L", "1")
-    suffix = suffix.replace("S", "5")
-    suffix = suffix.replace("B", "8")
-    suffix = suffix.replace("Z", "2")
+    character_replacements = {
+        "O": "0",
+        "D": "0",
+        "I": "1",
+        "L": "1",
+        "S": "5",
+        "B": "8",
+        "Z": "2",
+        "A": "4",
+        "T": "7"
+    }
 
-    if not re.fullmatch(r"\d{1,2}", suffix):
+    suffix = "".join(
+        character_replacements.get(
+            character,
+            character
+        )
+        for character in suffix
+    )
+
+    if not re.fullmatch(
+        r"\d{1,2}",
+        suffix
+    ):
         return None
 
     return f"TEAM{int(suffix)}"
 
 
-def parse_small_number(raw_text: str) -> int | None:
+def heading_needs_retry(
+    raw_text: str,
+    confidence: float
+) -> bool:
+    """
+    Decide whether a detected team heading needs targeted OCR.
+
+    Clear two-digit numeric headings are trusted.
+    Ambiguous or low-confidence headings are re-read.
+    """
+
+    cleaned_text = re.sub(
+        r"[^A-Z0-9]",
+        "",
+        raw_text.upper()
+    )
+
+    if not cleaned_text.startswith(
+        "TEAM"
+    ):
+        return True
+
+    suffix = cleaned_text[4:]
+
+    suffix_is_numeric = bool(
+        re.fullmatch(
+            r"\d{1,2}",
+            suffix
+        )
+    )
+
+    return (
+        confidence
+        < HEADER_RETRY_CONFIDENCE_THRESHOLD
+        or not suffix_is_numeric
+        or len(suffix) == 1
+    )
+
+
+def parse_small_number(
+    raw_text: str
+) -> int | None:
     """
     Read a small OCR number.
 
@@ -125,15 +299,31 @@ def parse_small_number(raw_text: str) -> int | None:
 
     cleaned = raw_text.strip().upper()
 
-    # Reject strings containing normal letters that are unlikely
-    # to be mistaken for digits.
-    if re.search(r"[A-HJ-KM-NP-RT-Z]", cleaned):
+    if re.search(
+        r"[A-HJ-KM-NP-RT-Z]",
+        cleaned
+    ):
         return None
 
-    cleaned = cleaned.replace("O", "0")
-    cleaned = cleaned.replace("I", "1")
-    cleaned = cleaned.replace("L", "1")
-    cleaned = cleaned.replace("|", "1")
+    cleaned = cleaned.replace(
+        "O",
+        "0"
+    )
+
+    cleaned = cleaned.replace(
+        "I",
+        "1"
+    )
+
+    cleaned = cleaned.replace(
+        "L",
+        "1"
+    )
+
+    cleaned = cleaned.replace(
+        "|",
+        "1"
+    )
 
     digits_only = re.sub(
         r"[^0-9]",
@@ -147,12 +337,16 @@ def parse_small_number(raw_text: str) -> int | None:
     if len(digits_only) > 2:
         return None
 
-    return int(digits_only)
+    return int(
+        digits_only
+    )
 
 
-def parse_kill_number(raw_text: str) -> int | None:
+def parse_kill_number(
+    raw_text: str
+) -> int | None:
     """
-    Read a kill value and correct a common false leading 9.
+    Read a kill count and correct a common false leading 9.
 
     Examples:
         95 -> 5
@@ -160,7 +354,9 @@ def parse_kill_number(raw_text: str) -> int | None:
         15 -> 15
     """
 
-    number = parse_small_number(raw_text)
+    number = parse_small_number(
+        raw_text
+    )
 
     if number is None:
         return None
@@ -195,18 +391,41 @@ def calculate_box_coordinates(
         for point in box
     ]
 
-    x_left = int(min(x_values))
-    x_right = int(max(x_values))
-    y_top = int(min(y_values))
-    y_bottom = int(max(y_values))
+    x_left = int(
+        min(x_values)
+    )
+
+    x_right = int(
+        max(x_values)
+    )
+
+    y_top = int(
+        min(y_values)
+    )
+
+    y_bottom = int(
+        max(y_values)
+    )
 
     return {
         "x_left": x_left,
         "x_right": x_right,
         "y_top": y_top,
         "y_bottom": y_bottom,
-        "x_centre": int((x_left + x_right) / 2),
-        "y_centre": int((y_top + y_bottom) / 2)
+        "x_centre": int(
+            (
+                x_left
+                + x_right
+            )
+            / 2
+        ),
+        "y_centre": int(
+            (
+                y_top
+                + y_bottom
+            )
+            / 2
+        )
     }
 
 
@@ -288,7 +507,10 @@ def calculate_iou(
     if combined_area == 0:
         return 0.0
 
-    return overlap_area / combined_area
+    return (
+        overlap_area
+        / combined_area
+    )
 
 
 def boxes_are_likely_duplicates(
@@ -296,8 +518,7 @@ def boxes_are_likely_duplicates(
     second_item: dict[str, Any]
 ) -> bool:
     """
-    Retry OCR passes sometimes return slightly different rectangles
-    for the same visible text. This reduces duplicate results.
+    Identify duplicate OCR blocks produced by retry passes.
     """
 
     if calculate_iou(
@@ -342,9 +563,7 @@ def merge_ocr_item(
     new_item: dict[str, Any]
 ) -> None:
     """
-    Add an OCR result unless the same area has already been detected.
-
-    Where duplicate detections exist, keep the higher-confidence result.
+    Merge one OCR result without retaining duplicate blocks.
     """
 
     for index, existing_item in enumerate(
@@ -358,7 +577,9 @@ def merge_ocr_item(
                 new_item["confidence"]
                 > existing_item["confidence"]
             ):
-                ocr_items[index] = new_item
+                ocr_items[
+                    index
+                ] = new_item
 
             return
 
@@ -375,59 +596,136 @@ def append_raw_ocr_results(
     y_offset: int = 0
 ) -> None:
     """
-    Convert EasyOCR results into parser-ready objects.
-
-    Offsets are applied where OCR was run against a dynamically
-    selected image region.
+    Convert EasyOCR output into parser-ready dictionaries.
     """
 
     for box, text, confidence in raw_results:
-        coordinates = calculate_box_coordinates(
-            box
+        coordinates = (
+            calculate_box_coordinates(
+                box
+            )
         )
 
-        coordinates["x_left"] += x_offset
-        coordinates["x_right"] += x_offset
-        coordinates["x_centre"] += x_offset
+        coordinates["x_left"] += (
+            x_offset
+        )
 
-        coordinates["y_top"] += y_offset
-        coordinates["y_bottom"] += y_offset
-        coordinates["y_centre"] += y_offset
+        coordinates["x_right"] += (
+            x_offset
+        )
 
-        new_item = {
-            "text": text.strip(),
-            "confidence": round(
-                float(confidence),
-                3
-            ),
-            "ocr_pass": pass_name,
-            **coordinates
-        }
+        coordinates["x_centre"] += (
+            x_offset
+        )
+
+        coordinates["y_top"] += (
+            y_offset
+        )
+
+        coordinates["y_bottom"] += (
+            y_offset
+        )
+
+        coordinates["y_centre"] += (
+            y_offset
+        )
 
         merge_ocr_item(
             ocr_items,
-            new_item
+            {
+                "text": text.strip(),
+                "confidence": round(
+                    float(
+                        confidence
+                    ),
+                    3
+                ),
+                "ocr_pass": pass_name,
+                **coordinates
+            }
         )
 
 
-# ============================================================
-# OCR RETRY IMAGE VARIANTS
-# ============================================================
-
-def create_retry_variants(
-    image_region: Any
-) -> list[tuple[str, Any]]:
+def run_ocr(
+    reader: easyocr.Reader,
+    image: Any,
+    pass_name: str
+) -> list[Any]:
     """
-    Create alternate image versions to improve OCR recovery.
+    Run EasyOCR with conservative CPU settings.
     """
 
-    if len(image_region.shape) == 3:
+    started_at = time.perf_counter()
+
+    log(
+        f"Starting OCR pass: {pass_name}"
+    )
+
+    results = reader.readtext(
+        image,
+        detail=1,
+        paragraph=False,
+        decoder="greedy",
+        batch_size=1,
+        workers=0
+    )
+
+    elapsed = round(
+        time.perf_counter()
+        - started_at,
+        2
+    )
+
+    log(
+        f"Finished OCR pass: {pass_name} "
+        f"in {elapsed}s with "
+        f"{len(results)} block(s)."
+    )
+
+    return results
+
+
+# ============================================================
+# RETRY IMAGE VARIANTS
+# ============================================================
+
+def generate_retry_variants(
+    image_region: Any,
+    maximum_variants: int
+) -> Generator[
+    tuple[str, Any],
+    None,
+    None
+]:
+    """
+    Yield retry images one at a time.
+
+    The previous implementation created every variant in memory at once.
+    This version generates and releases them progressively.
+    """
+
+    if maximum_variants <= 0:
+        return
+
+    yield (
+        "colour",
+        image_region
+    )
+
+    if maximum_variants == 1:
+        return
+
+    if len(
+        image_region.shape
+    ) == 3:
         grayscale = cv2.cvtColor(
             image_region,
             cv2.COLOR_BGR2GRAY
         )
     else:
-        grayscale = image_region
+        grayscale = (
+            image_region.copy()
+        )
 
     clahe = cv2.createCLAHE(
         clipLimit=2.0,
@@ -438,6 +736,17 @@ def create_retry_variants(
         grayscale
     )
 
+    yield (
+        "contrast",
+        contrast_enhanced
+    )
+
+    if maximum_variants == 2:
+        del grayscale
+        del contrast_enhanced
+        gc.collect()
+        return
+
     adaptive_threshold = cv2.adaptiveThreshold(
         contrast_enhanced,
         255,
@@ -447,28 +756,16 @@ def create_retry_variants(
         7
     )
 
-    inverted_threshold = cv2.bitwise_not(
+    yield (
+        "threshold",
         adaptive_threshold
     )
 
-    return [
-        (
-            "retry_colour",
-            image_region
-        ),
-        (
-            "retry_contrast",
-            contrast_enhanced
-        ),
-        (
-            "retry_threshold",
-            adaptive_threshold
-        ),
-        (
-            "retry_inverted",
-            inverted_threshold
-        )
-    ]
+    del grayscale
+    del contrast_enhanced
+    del adaptive_threshold
+
+    gc.collect()
 
 
 # ============================================================
@@ -480,7 +777,7 @@ def group_items_by_y(
     tolerance: int
 ) -> list[dict[str, Any]]:
     """
-    Group OCR blocks that appear on approximately the same visual row.
+    Group OCR blocks that appear on approximately the same row.
     """
 
     if not items:
@@ -488,7 +785,9 @@ def group_items_by_y(
 
     sorted_items = sorted(
         items,
-        key=lambda item: item["y_centre"]
+        key=lambda item: item[
+            "y_centre"
+        ]
     )
 
     rows = []
@@ -509,30 +808,46 @@ def group_items_by_y(
 
         if matching_row is None:
             rows.append({
-                "average_y": item["y_centre"],
-                "items": [item]
+                "average_y": item[
+                    "y_centre"
+                ],
+                "items": [
+                    item
+                ]
             })
 
         else:
-            matching_row["items"].append(
+            matching_row[
+                "items"
+            ].append(
                 item
             )
 
-            matching_row["average_y"] = int(
+            matching_row[
+                "average_y"
+            ] = int(
                 sum(
-                    row_item["y_centre"]
+                    row_item[
+                        "y_centre"
+                    ]
                     for row_item
-                    in matching_row["items"]
+                    in matching_row[
+                        "items"
+                    ]
                 )
                 / len(
-                    matching_row["items"]
+                    matching_row[
+                        "items"
+                    ]
                 )
             )
 
     for row in rows:
         row["items"] = sorted(
             row["items"],
-            key=lambda item: item["x_left"]
+            key=lambda item: item[
+                "x_left"
+            ]
         )
 
     return rows
@@ -542,27 +857,31 @@ def group_anchors_into_visual_rows(
     team_anchors: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """
-    Group detected team headings into visible horizontal rows.
+    Group team headings into horizontal scoreboard rows.
     """
 
     if not team_anchors:
         return []
 
-    sorted_anchors = sorted(
-        team_anchors,
-        key=lambda anchor: anchor["y_centre"]
-    )
-
     visual_rows = []
 
-    for anchor in sorted_anchors:
+    for anchor in sorted(
+        team_anchors,
+        key=lambda item: item[
+            "y_centre"
+        ]
+    ):
         matching_row = None
 
         for row in visual_rows:
             if (
                 abs(
-                    anchor["y_centre"]
-                    - row["average_y"]
+                    anchor[
+                        "y_centre"
+                    ]
+                    - row[
+                        "average_y"
+                    ]
                 )
                 <= 75
             ):
@@ -571,42 +890,60 @@ def group_anchors_into_visual_rows(
 
         if matching_row is None:
             visual_rows.append({
-                "average_y": anchor["y_centre"],
-                "anchors": [anchor]
+                "average_y": anchor[
+                    "y_centre"
+                ],
+                "anchors": [
+                    anchor
+                ]
             })
 
         else:
-            matching_row["anchors"].append(
+            matching_row[
+                "anchors"
+            ].append(
                 anchor
             )
 
-            matching_row["average_y"] = int(
+            matching_row[
+                "average_y"
+            ] = int(
                 sum(
-                    item["y_centre"]
+                    item[
+                        "y_centre"
+                    ]
                     for item
-                    in matching_row["anchors"]
+                    in matching_row[
+                        "anchors"
+                    ]
                 )
                 / len(
-                    matching_row["anchors"]
+                    matching_row[
+                        "anchors"
+                    ]
                 )
             )
 
     visual_rows = sorted(
         visual_rows,
-        key=lambda row: row["average_y"]
+        key=lambda row: row[
+            "average_y"
+        ]
     )
 
     for row in visual_rows:
         row["anchors"] = sorted(
             row["anchors"],
-            key=lambda anchor: anchor["x_centre"]
+            key=lambda anchor: anchor[
+                "x_centre"
+            ]
         )
 
     return visual_rows
 
 
 # ============================================================
-# GRID POSITION HELPERS
+# GRID HELPERS
 # ============================================================
 
 def estimate_card_width(
@@ -614,35 +951,46 @@ def estimate_card_width(
     image_width: int
 ) -> int:
     """
-    Estimate team-card width from spacing between detected headings.
+    Estimate card width from spacing between detected headings.
     """
 
-    x_differences = []
+    differences = []
 
-    visual_rows = group_anchors_into_visual_rows(
+    for row in group_anchors_into_visual_rows(
         team_anchors
-    )
-
-    for row in visual_rows:
-        anchors = row["anchors"]
+    ):
+        anchors = row[
+            "anchors"
+        ]
 
         for index in range(
-            len(anchors) - 1
+            len(
+                anchors
+            )
+            - 1
         ):
             difference = (
-                anchors[index + 1]["x_centre"]
-                - anchors[index]["x_centre"]
+                anchors[
+                    index + 1
+                ][
+                    "x_centre"
+                ]
+                - anchors[
+                    index
+                ][
+                    "x_centre"
+                ]
             )
 
             if difference > 100:
-                x_differences.append(
+                differences.append(
                     difference
                 )
 
-    if x_differences:
+    if differences:
         return int(
             median(
-                x_differences
+                differences
             )
         )
 
@@ -660,11 +1008,8 @@ def cluster_coordinate_values(
     tolerance: int
 ) -> list[int]:
     """
-    Convert nearby coordinate values into approximate grid positions.
+    Convert nearby coordinates into approximate grid positions.
     """
-
-    if not values:
-        return []
 
     clusters = []
 
@@ -677,35 +1022,52 @@ def cluster_coordinate_values(
             if (
                 abs(
                     value
-                    - cluster["average"]
+                    - cluster[
+                        "average"
+                    ]
                 )
                 <= tolerance
             ):
-                matching_cluster = cluster
+                matching_cluster = (
+                    cluster
+                )
+
                 break
 
         if matching_cluster is None:
             clusters.append({
                 "average": value,
-                "values": [value]
+                "values": [
+                    value
+                ]
             })
 
         else:
-            matching_cluster["values"].append(
+            matching_cluster[
+                "values"
+            ].append(
                 value
             )
 
-            matching_cluster["average"] = int(
+            matching_cluster[
+                "average"
+            ] = int(
                 sum(
-                    matching_cluster["values"]
+                    matching_cluster[
+                        "values"
+                    ]
                 )
                 / len(
-                    matching_cluster["values"]
+                    matching_cluster[
+                        "values"
+                    ]
                 )
             )
 
     return sorted(
-        cluster["average"]
+        cluster[
+            "average"
+        ]
         for cluster
         in clusters
     )
@@ -719,18 +1081,22 @@ def find_anchor_near_position(
     y_tolerance: int
 ) -> dict[str, Any] | None:
     """
-    Check whether a heading already occupies an expected grid position.
+    Check whether a heading already occupies a grid position.
     """
 
     for anchor in team_anchors:
         if (
             abs(
-                anchor["x_centre"]
+                anchor[
+                    "x_centre"
+                ]
                 - expected_x
             )
             <= x_tolerance
             and abs(
-                anchor["y_centre"]
+                anchor[
+                    "y_centre"
+                ]
                 - expected_y
             )
             <= y_tolerance
@@ -751,10 +1117,10 @@ def find_nearby_rank_for_position(
     card_width: int
 ) -> int | None:
     """
-    Find a placement number close to an expected card-heading position.
+    Find a placement number to the left of a team heading.
     """
 
-    possible_ranks = []
+    candidates = []
 
     for item in ocr_items:
         number = parse_small_number(
@@ -769,12 +1135,16 @@ def find_nearby_rank_for_position(
 
         horizontal_distance = (
             expected_x
-            - item["x_centre"]
+            - item[
+                "x_centre"
+            ]
         )
 
         vertical_distance = abs(
             expected_y
-            - item["y_centre"]
+            - item[
+                "y_centre"
+            ]
         )
 
         if (
@@ -783,7 +1153,7 @@ def find_nearby_rank_for_position(
             <= card_width * 0.95
             and vertical_distance <= 60
         ):
-            possible_ranks.append({
+            candidates.append({
                 "rank": number,
                 "distance": (
                     horizontal_distance
@@ -791,40 +1161,24 @@ def find_nearby_rank_for_position(
                 )
             })
 
-    if not possible_ranks:
+    if not candidates:
         return None
 
-    best_match = min(
-        possible_ranks,
-        key=lambda match: match["distance"]
-    )
-
-    return best_match["rank"]
-
-
-def find_nearby_rank(
-    anchor: dict[str, Any],
-    ocr_items: list[dict[str, Any]],
-    card_width: int
-) -> int | None:
-    """
-    Find the placement number to the left of a detected heading.
-    """
-
-    return find_nearby_rank_for_position(
-        expected_x=anchor["x_centre"],
-        expected_y=anchor["y_centre"],
-        ocr_items=ocr_items,
-        card_width=card_width
-    )
+    return min(
+        candidates,
+        key=lambda item: item[
+            "distance"
+        ]
+    )[
+        "rank"
+    ]
 
 
 def infer_missing_ranks(
     ordered_anchors: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """
-    Fill missing placement values where surrounding visible ranks make
-    the missing value clear.
+    Infer missing placements from surrounding visible ranks.
     """
 
     known_offsets = []
@@ -832,9 +1186,13 @@ def infer_missing_ranks(
     for index, anchor in enumerate(
         ordered_anchors
     ):
-        if anchor["placement"] is not None:
+        if anchor[
+            "placement"
+        ] is not None:
             known_offsets.append(
-                anchor["placement"]
+                anchor[
+                    "placement"
+                ]
                 - index
             )
 
@@ -852,21 +1210,28 @@ def infer_missing_ranks(
     for index, anchor in enumerate(
         ordered_anchors
     ):
-        if anchor["placement"] is None:
+        if anchor[
+            "placement"
+        ] is None:
             inferred_rank = (
                 index
                 + likely_offset
             )
 
             if inferred_rank > 0:
-                anchor["placement"] = inferred_rank
-                anchor["placement_inferred"] = True
+                anchor[
+                    "placement"
+                ] = inferred_rank
+
+                anchor[
+                    "placement_inferred"
+                ] = True
 
     return ordered_anchors
 
 
 # ============================================================
-# TARGETED TEAM-HEADING OCR
+# TEAM HEADER OCR
 # ============================================================
 
 def collect_team_heading_candidates(
@@ -874,10 +1239,11 @@ def collect_team_heading_candidates(
     source_image: Any,
     expected_x: int,
     expected_y: int,
-    card_width: int
+    card_width: int,
+    maximum_variants: int
 ) -> list[dict[str, Any]]:
     """
-    Run targeted OCR around one expected heading position.
+    Re-read a small heading region progressively.
     """
 
     image_height, image_width = (
@@ -924,128 +1290,148 @@ def collect_team_heading_candidates(
     if heading_region.size == 0:
         return []
 
-    possible_headings = []
+    candidates = []
 
-    for pass_name, variant in create_retry_variants(
-        heading_region
+    for variant_name, variant in (
+        generate_retry_variants(
+            heading_region,
+            maximum_variants
+        )
     ):
-        retry_results = reader.readtext(
+        retry_results = run_ocr(
+            reader,
             variant,
-            detail=1,
-            paragraph=False,
-            text_threshold=0.35,
-            low_text=0.20,
-            link_threshold=0.20,
-            contrast_ths=0.05,
-            adjust_contrast=0.80
+            (
+                "heading-"
+                + variant_name
+            )
         )
 
-        for box, text, confidence in retry_results:
-            corrected_team = normalise_team_heading(
-                text
+        for box, text, confidence in (
+            retry_results
+        ):
+            normalised_team = (
+                normalise_team_heading(
+                    text
+                )
             )
 
-            if corrected_team is None:
+            if normalised_team is None:
                 continue
 
-            coordinates = calculate_box_coordinates(
-                box
+            coordinates = (
+                calculate_box_coordinates(
+                    box
+                )
             )
 
-            absolute_x_centre = (
-                coordinates["x_centre"]
+            absolute_x = (
+                coordinates[
+                    "x_centre"
+                ]
                 + x_left
             )
 
-            absolute_y_centre = (
-                coordinates["y_centre"]
+            absolute_y = (
+                coordinates[
+                    "y_centre"
+                ]
                 + y_top
             )
 
-            # Prevent text from a neighbouring card being selected.
             if (
                 abs(
-                    absolute_x_centre
+                    absolute_x
                     - expected_x
                 )
                 > card_width * 0.32
                 or abs(
-                    absolute_y_centre
+                    absolute_y
                     - expected_y
                 )
                 > card_width * 0.16
             ):
                 continue
 
-            possible_headings.append({
-                "team": corrected_team,
-                "original_team_ocr_text": text,
+            candidates.append({
+                "team": normalised_team,
+                "original_team_ocr_text": (
+                    text
+                ),
                 "team_heading_confidence": round(
                     float(
                         confidence
                     ),
                     3
                 ),
-                "x_centre": absolute_x_centre,
-                "y_centre": absolute_y_centre,
-                "ocr_pass": pass_name
+                "x_centre": absolute_x,
+                "y_centre": absolute_y,
+                "ocr_pass": (
+                    variant_name
+                )
             })
 
-    return possible_headings
+        del retry_results
+        gc.collect()
+
+    return candidates
 
 
-def choose_best_team_heading_candidate(
+def choose_best_heading_candidate(
     candidates: list[dict[str, Any]],
     fallback: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
     """
-    Choose the strongest team heading across multiple OCR retry passes.
-
-    Repeated readings receive additional weight.
+    Choose the best heading using confidence and repeated readings.
     """
 
-    candidates = list(
+    all_candidates = list(
         candidates
     )
 
     if fallback is not None:
-        candidates.append(
+        all_candidates.append(
             fallback
         )
 
-    if not candidates:
+    if not all_candidates:
         return None
 
-    grouped = {}
+    grouped_candidates = {}
 
-    for candidate in candidates:
-        grouped.setdefault(
-            candidate["team"],
+    for candidate in all_candidates:
+        grouped_candidates.setdefault(
+            candidate[
+                "team"
+            ],
             []
         ).append(
             candidate
         )
 
-    scored_candidates = []
+    scored_results = []
 
-    for team_name, team_candidates in grouped.items():
+    for team_name, group in (
+        grouped_candidates.items()
+    ):
         best_candidate = max(
-            team_candidates,
+            group,
             key=lambda item: item[
                 "team_heading_confidence"
             ]
         )
 
         score = sum(
-            item["team_heading_confidence"]
-            for item
-            in team_candidates
+            item[
+                "team_heading_confidence"
+            ]
+            for item in group
         )
 
         score += (
             0.15
             * len(
-                team_candidates
+                group
             )
         )
 
@@ -1060,7 +1446,7 @@ def choose_best_team_heading_candidate(
             )
         )
 
-        scored_candidates.append(
+        scored_results.append(
             (
                 score,
                 best_candidate
@@ -1068,25 +1454,97 @@ def choose_best_team_heading_candidate(
         )
 
     return max(
-        scored_candidates,
+        scored_results,
         key=lambda item: item[0]
     )[1]
 
 
-def refine_detected_team_headers(
+def remove_duplicate_team_anchors(
+    team_anchors: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """
+    Remove headings detected more than once at the same position.
+    """
+
+    unique_anchors = []
+
+    for anchor in sorted(
+        team_anchors,
+        key=lambda item: (
+            item[
+                "y_centre"
+            ],
+            item[
+                "x_centre"
+            ]
+        )
+    ):
+        matching_index = None
+
+        for index, existing in enumerate(
+            unique_anchors
+        ):
+            if (
+                abs(
+                    existing[
+                        "x_centre"
+                    ]
+                    - anchor[
+                        "x_centre"
+                    ]
+                )
+                < 35
+                and abs(
+                    existing[
+                        "y_centre"
+                    ]
+                    - anchor[
+                        "y_centre"
+                    ]
+                )
+                < 35
+            ):
+                matching_index = index
+                break
+
+        if matching_index is None:
+            unique_anchors.append(
+                anchor
+            )
+
+        else:
+            existing = unique_anchors[
+                matching_index
+            ]
+
+            if (
+                anchor.get(
+                    "team_heading_confidence",
+                    0.0
+                )
+                > existing.get(
+                    "team_heading_confidence",
+                    0.0
+                )
+            ):
+                unique_anchors[
+                    matching_index
+                ] = anchor
+
+    return unique_anchors
+
+
+def refine_uncertain_team_headers(
     team_anchors: list[dict[str, Any]],
     reader: easyocr.Reader,
     source_image: Any,
     image_width: int
 ) -> list[dict[str, Any]]:
     """
-    Recheck each detected heading.
+    Retry only uncertain team headings.
 
-    This helps where the full-image pass reads TEAM12 as TEAM2.
+    Clear headings are kept without extra OCR calls.
     """
-
-    if not team_anchors:
-        return []
 
     card_width = estimate_card_width(
         team_anchors,
@@ -1096,17 +1554,47 @@ def refine_detected_team_headers(
     refined_anchors = []
 
     for anchor in team_anchors:
-        candidates = collect_team_heading_candidates(
-            reader=reader,
-            source_image=source_image,
-            expected_x=anchor["x_centre"],
-            expected_y=anchor["y_centre"],
-            card_width=card_width
+        if not heading_needs_retry(
+            anchor[
+                "original_team_ocr_text"
+            ],
+            anchor[
+                "team_heading_confidence"
+            ]
+        ):
+            refined_anchors.append(
+                anchor
+            )
+
+            continue
+
+        log(
+            f"Refining uncertain heading "
+            f"'{anchor['original_team_ocr_text']}'."
         )
 
-        best_candidate = choose_best_team_heading_candidate(
-            candidates=candidates,
-            fallback=anchor
+        candidates = (
+            collect_team_heading_candidates(
+                reader=reader,
+                source_image=source_image,
+                expected_x=anchor[
+                    "x_centre"
+                ],
+                expected_y=anchor[
+                    "y_centre"
+                ],
+                card_width=card_width,
+                maximum_variants=(
+                    MAX_HEADER_RETRY_VARIANTS
+                )
+            )
+        )
+
+        best_candidate = (
+            choose_best_heading_candidate(
+                candidates,
+                fallback=anchor
+            )
         )
 
         if best_candidate is None:
@@ -1116,9 +1604,15 @@ def refine_detected_team_headers(
 
             continue
 
-        best_candidate["header_refined"] = (
-            best_candidate["team"]
-            != anchor["team"]
+        best_candidate[
+            "header_refined"
+        ] = (
+            best_candidate[
+                "team"
+            ]
+            != anchor[
+                "team"
+            ]
         )
 
         refined_anchors.append(
@@ -1136,18 +1630,14 @@ def recover_missing_team_headers(
     image_width: int
 ) -> list[dict[str, Any]]:
     """
-    Recover empty positions in the visible scoreboard grid.
+    Re-read only empty grid positions.
 
-    Example:
-        Placement 8 contains TEAM24, but the initial OCR pass fails to
-        read TEAM24. The expected middle position in the final grid row
-        is identified and scanned again.
-
-    Where the heading remains unreadable but the rank is visible, a
-    placeholder team is returned instead of silently dropping the card.
+    This handles cases such as a missed TEAM24 card at placement 8.
     """
 
-    if len(team_anchors) < 4:
+    if len(
+        team_anchors
+    ) < 4:
         return team_anchors
 
     card_width = estimate_card_width(
@@ -1157,7 +1647,9 @@ def recover_missing_team_headers(
 
     x_positions = cluster_coordinate_values(
         [
-            anchor["x_centre"]
+            anchor[
+                "x_centre"
+            ]
             for anchor
             in team_anchors
         ],
@@ -1172,7 +1664,9 @@ def recover_missing_team_headers(
 
     y_positions = cluster_coordinate_values(
         [
-            anchor["y_centre"]
+            anchor[
+                "y_centre"
+            ]
             for anchor
             in team_anchors
         ],
@@ -1186,8 +1680,14 @@ def recover_missing_team_headers(
     )
 
     if (
-        len(x_positions) < 2
-        or len(y_positions) < 2
+        len(
+            x_positions
+        )
+        < 2
+        or len(
+            y_positions
+        )
+        < 2
     ):
         return team_anchors
 
@@ -1197,40 +1697,48 @@ def recover_missing_team_headers(
 
     for expected_y in y_positions:
         for expected_x in x_positions:
-            existing_anchor = find_anchor_near_position(
-                team_anchors=recovered_anchors,
-                expected_x=expected_x,
-                expected_y=expected_y,
-                x_tolerance=int(
-                    card_width
-                    * 0.25
-                ),
-                y_tolerance=int(
-                    card_width
-                    * 0.16
+            existing_anchor = (
+                find_anchor_near_position(
+                    team_anchors=(
+                        recovered_anchors
+                    ),
+                    expected_x=expected_x,
+                    expected_y=expected_y,
+                    x_tolerance=int(
+                        card_width
+                        * 0.25
+                    ),
+                    y_tolerance=int(
+                        card_width
+                        * 0.16
+                    )
                 )
             )
 
             if existing_anchor is not None:
                 continue
 
-            nearby_rank = find_nearby_rank_for_position(
-                expected_x=expected_x,
-                expected_y=expected_y,
-                ocr_items=ocr_items,
-                card_width=card_width
+            log(
+                "Scanning a missing grid position."
             )
 
-            candidates = collect_team_heading_candidates(
-                reader=reader,
-                source_image=source_image,
-                expected_x=expected_x,
-                expected_y=expected_y,
-                card_width=card_width
+            candidates = (
+                collect_team_heading_candidates(
+                    reader=reader,
+                    source_image=source_image,
+                    expected_x=expected_x,
+                    expected_y=expected_y,
+                    card_width=card_width,
+                    maximum_variants=(
+                        MAX_MISSING_HEADER_RETRY_VARIANTS
+                    )
+                )
             )
 
-            best_candidate = choose_best_team_heading_candidate(
-                candidates=candidates
+            best_candidate = (
+                choose_best_heading_candidate(
+                    candidates
+                )
             )
 
             if best_candidate is not None:
@@ -1246,20 +1754,29 @@ def recover_missing_team_headers(
                     best_candidate
                 )
 
-                print(
-                    f"Recovered missing heading: "
-                    f"{best_candidate['team']} "
-                    f"from OCR text "
-                    f"'{best_candidate['original_team_ocr_text']}'"
+                log(
+                    f"Recovered missing heading "
+                    f"{best_candidate['team']}."
                 )
 
                 continue
 
+            nearby_rank = (
+                find_nearby_rank_for_position(
+                    expected_x=expected_x,
+                    expected_y=expected_y,
+                    ocr_items=ocr_items,
+                    card_width=card_width
+                )
+            )
+
             if nearby_rank is not None:
-                placeholder_anchor = {
+                recovered_anchors.append({
                     "team": (
-                        f"UNKNOWN_TEAM_AT_PLACE_"
-                        f"{nearby_rank}"
+                        "UNKNOWN_TEAM_AT_PLACE_"
+                        + str(
+                            nearby_rank
+                        )
                     ),
                     "original_team_ocr_text": "",
                     "team_heading_confidence": 0.0,
@@ -1268,86 +1785,18 @@ def recover_missing_team_headers(
                     "recovered_from_missing_grid_position": True,
                     "header_refined": False,
                     "team_name_needs_review": True
-                }
+                })
 
-                recovered_anchors.append(
-                    placeholder_anchor
-                )
-
-                print(
-                    f"Recovered missing card at placement "
-                    f"{nearby_rank}, but its heading still "
-                    f"needs review."
+                log(
+                    f"Recovered an unreadable card "
+                    f"at placement {nearby_rank}."
                 )
 
     return recovered_anchors
 
 
-def remove_duplicate_team_anchors(
-    team_anchors: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """
-    Remove multiple headings detected at approximately the same position.
-    """
-
-    unique_anchors = []
-
-    for anchor in sorted(
-        team_anchors,
-        key=lambda item: (
-            item["y_centre"],
-            item["x_centre"]
-        )
-    ):
-        duplicate_index = None
-
-        for index, existing in enumerate(
-            unique_anchors
-        ):
-            if (
-                abs(
-                    existing["x_centre"]
-                    - anchor["x_centre"]
-                )
-                < 35
-                and abs(
-                    existing["y_centre"]
-                    - anchor["y_centre"]
-                )
-                < 35
-            ):
-                duplicate_index = index
-                break
-
-        if duplicate_index is None:
-            unique_anchors.append(
-                anchor
-            )
-
-        else:
-            existing = unique_anchors[
-                duplicate_index
-            ]
-
-            if (
-                anchor.get(
-                    "team_heading_confidence",
-                    0
-                )
-                > existing.get(
-                    "team_heading_confidence",
-                    0
-                )
-            ):
-                unique_anchors[
-                    duplicate_index
-                ] = anchor
-
-    return unique_anchors
-
-
 # ============================================================
-# DYNAMIC CARD REGIONS
+# CARD REGIONS
 # ============================================================
 
 def build_team_regions(
@@ -1355,13 +1804,18 @@ def build_team_regions(
     ocr_items: list[dict[str, Any]],
     image_width: int,
     image_height: int
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[
+    list[dict[str, Any]],
+    int
+]:
     """
-    Create card areas dynamically from team-heading positions.
+    Create dynamic card regions from visible headings.
     """
 
-    visual_rows = group_anchors_into_visual_rows(
-        team_anchors
+    visual_rows = (
+        group_anchors_into_visual_rows(
+            team_anchors
+        )
     )
 
     card_width = estimate_card_width(
@@ -1374,37 +1828,59 @@ def build_team_regions(
     for row_index, row in enumerate(
         visual_rows
     ):
-        for column_index, anchor in enumerate(
-            row["anchors"]
+        for column_index, anchor in (
+            enumerate(
+                row[
+                    "anchors"
+                ]
+            )
         ):
-            anchor["visual_row"] = row_index
-            anchor["visual_column"] = column_index
+            anchor[
+                "visual_row"
+            ] = row_index
+
+            anchor[
+                "visual_column"
+            ] = column_index
 
             ordered_anchors.append(
                 anchor
             )
 
     for anchor in ordered_anchors:
-        anchor["placement"] = find_nearby_rank(
-            anchor=anchor,
+        anchor[
+            "placement"
+        ] = find_nearby_rank_for_position(
+            expected_x=anchor[
+                "x_centre"
+            ],
+            expected_y=anchor[
+                "y_centre"
+            ],
             ocr_items=ocr_items,
             card_width=card_width
         )
 
-        anchor["placement_inferred"] = False
+        anchor[
+            "placement_inferred"
+        ] = False
 
     ordered_anchors = infer_missing_ranks(
         ordered_anchors
     )
 
     row_header_positions = [
-        row["average_y"]
+        row[
+            "average_y"
+        ]
         for row
         in visual_rows
     ]
 
     for anchor in ordered_anchors:
-        row_index = anchor["visual_row"]
+        row_index = anchor[
+            "visual_row"
+        ]
 
         if (
             row_index + 1
@@ -1422,25 +1898,35 @@ def build_team_regions(
         else:
             y_bottom = image_height
 
-        anchor["region"] = {
+        anchor[
+            "region"
+        ] = {
             "x_left": max(
                 0,
                 int(
-                    anchor["x_centre"]
-                    - card_width * 0.92
+                    anchor[
+                        "x_centre"
+                    ]
+                    - card_width
+                    * 0.92
                 )
             ),
             "x_right": min(
                 image_width,
                 int(
-                    anchor["x_centre"]
-                    + card_width * 0.12
+                    anchor[
+                        "x_centre"
+                    ]
+                    + card_width
+                    * 0.12
                 )
             ),
             "y_top": max(
                 0,
                 int(
-                    anchor["y_centre"]
+                    anchor[
+                        "y_centre"
+                    ]
                     + 20
                 )
             ),
@@ -1464,13 +1950,7 @@ def weighted_non_overlapping_name_items(
     items: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """
-    Choose the best non-overlapping OCR blocks for a player name.
-
-    This keeps split names such as:
-        MR_ICE + MAN
-
-    while avoiding duplicate retry readings such as:
-        ChatGPT + ChatGPT
+    Keep split names while avoiding duplicate retry readings.
     """
 
     if not items:
@@ -1479,8 +1959,12 @@ def weighted_non_overlapping_name_items(
     sorted_items = sorted(
         items,
         key=lambda item: (
-            item["x_right"],
-            item["x_left"]
+            item[
+                "x_right"
+            ],
+            item[
+                "x_left"
+            ]
         )
     )
 
@@ -1499,10 +1983,18 @@ def weighted_non_overlapping_name_items(
             if (
                 sorted_items[
                     earlier_index
-                ]["x_right"]
-                < item["x_left"] - 3
+                ][
+                    "x_right"
+                ]
+                < item[
+                    "x_left"
+                ]
+                - 3
             ):
-                compatible_index = earlier_index
+                compatible_index = (
+                    earlier_index
+                )
+
                 break
 
         previous_indexes.append(
@@ -1534,15 +2026,21 @@ def weighted_non_overlapping_name_items(
     ):
         width = max(
             1,
-            item["x_right"]
-            - item["x_left"]
+            item[
+                "x_right"
+            ]
+            - item[
+                "x_left"
+            ]
         )
 
         item_score = (
             width
             * max(
                 0.15,
-                item["confidence"]
+                item[
+                    "confidence"
+                ]
             )
         )
 
@@ -1567,25 +2065,39 @@ def weighted_non_overlapping_name_items(
         )
 
         if include_score > exclude_score:
-            best_scores[index] = include_score
+            best_scores[
+                index
+            ] = include_score
 
-            selections[index] = (
+            selections[
+                index
+            ] = (
                 selections[
                     previous_index
                 ]
-                + [item]
+                + [
+                    item
+                ]
             )
 
         else:
-            best_scores[index] = exclude_score
+            best_scores[
+                index
+            ] = exclude_score
 
-            selections[index] = selections[
+            selections[
+                index
+            ] = selections[
                 index - 1
             ]
 
     return sorted(
-        selections[-1],
-        key=lambda item: item["x_left"]
+        selections[
+            -1
+        ],
+        key=lambda item: item[
+            "x_left"
+        ]
     )
 
 
@@ -1595,25 +2107,37 @@ def extract_players_for_team(
     card_width: int
 ) -> list[dict[str, Any]]:
     """
-    Extract player names and kills from one dynamically calculated card.
+    Extract player names and kill counts for one team card.
     """
 
-    region = anchor["region"]
+    region = anchor[
+        "region"
+    ]
 
-    region_items = []
-
-    for item in ocr_items:
+    region_items = [
+        item
+        for item in ocr_items
         if (
-            region["x_left"]
-            <= item["x_centre"]
-            <= region["x_right"]
-            and region["y_top"]
-            <= item["y_centre"]
-            <= region["y_bottom"]
-        ):
-            region_items.append(
-                item
-            )
+            region[
+                "x_left"
+            ]
+            <= item[
+                "x_centre"
+            ]
+            <= region[
+                "x_right"
+            ]
+            and region[
+                "y_top"
+            ]
+            <= item[
+                "y_centre"
+            ]
+            <= region[
+                "y_bottom"
+            ]
+        )
+    ]
 
     grouped_rows = group_items_by_y(
         items=region_items,
@@ -1629,33 +2153,38 @@ def extract_players_for_team(
     players = []
 
     for row in grouped_rows:
-        row_items = row["items"]
-
         numeric_candidates = []
 
-        for item in row_items:
+        for item in row[
+            "items"
+        ]:
             number = parse_kill_number(
-                item["text"]
+                item[
+                    "text"
+                ]
             )
 
             if number is None:
                 continue
 
-            distance_from_kill_column = abs(
-                item["x_centre"]
-                - anchor["x_centre"]
+            distance = abs(
+                item[
+                    "x_centre"
+                ]
+                - anchor[
+                    "x_centre"
+                ]
             )
 
             if (
-                distance_from_kill_column
-                <= card_width * 0.22
+                distance
+                <= card_width
+                * 0.22
             ):
                 numeric_candidates.append({
                     "item": item,
                     "number": number,
-                    "distance": (
-                        distance_from_kill_column
-                    )
+                    "distance": distance
                 })
 
         if not numeric_candidates:
@@ -1663,79 +2192,103 @@ def extract_players_for_team(
 
         kill_match = min(
             numeric_candidates,
-            key=lambda candidate: (
-                candidate["distance"],
-                -candidate["item"][
+            key=lambda item: (
+                item[
+                    "distance"
+                ],
+                -item[
+                    "item"
+                ][
                     "confidence"
                 ]
             )
         )
 
-        kill_item = kill_match["item"]
-        kills = kill_match["number"]
+        kill_item = kill_match[
+            "item"
+        ]
 
         possible_name_items = [
             item
             for item
-            in row_items
+            in row[
+                "items"
+            ]
             if (
-                item["x_right"]
-                < kill_item["x_left"] - 4
+                item[
+                    "x_right"
+                ]
+                < kill_item[
+                    "x_left"
+                ]
+                - 4
                 and parse_small_number(
-                    item["text"]
+                    item[
+                        "text"
+                    ]
                 )
                 is None
                 and normalise_team_heading(
-                    item["text"]
+                    item[
+                        "text"
+                    ]
                 )
                 is None
             )
         ]
 
-        name_items = weighted_non_overlapping_name_items(
-            possible_name_items
+        name_items = (
+            weighted_non_overlapping_name_items(
+                possible_name_items
+            )
         )
 
         if not name_items:
             continue
 
-        raw_name = " ".join(
-            item["text"].strip()
+        player_name = " ".join(
+            item[
+                "text"
+            ].strip()
             for item
             in name_items
-            if item["text"].strip()
+            if item[
+                "text"
+            ].strip()
         ).strip()
 
-        if not raw_name:
+        if player_name == "":
             continue
 
-        name_confidences = [
-            item["confidence"]
-            for item
-            in name_items
-        ]
-
-        average_name_confidence = round(
+        name_confidence = round(
             sum(
-                name_confidences
+                item[
+                    "confidence"
+                ]
+                for item
+                in name_items
             )
             / len(
-                name_confidences
+                name_items
             ),
             3
         )
 
         players.append({
-            "ign": raw_name,
-            "kills": kills,
+            "ign": player_name,
+            "kills": kill_match[
+                "number"
+            ],
             "name_confidence": (
-                average_name_confidence
+                name_confidence
             ),
             "kill_confidence": (
-                kill_item["confidence"]
+                kill_item[
+                    "confidence"
+                ]
             ),
             "needs_review": (
-                average_name_confidence
+                name_confidence
                 < 0.70
             )
         })
@@ -1743,26 +2296,36 @@ def extract_players_for_team(
     return players
 
 
-# ============================================================
-# DYNAMIC PLAYER-ROW RETRY
-# ============================================================
-
-def retry_team_region(
+def retry_missing_player_rows(
     anchor: dict[str, Any],
     reader: easyocr.Reader,
     source_image: Any,
-    ocr_items: list[dict[str, Any]]
-) -> None:
+    ocr_items: list[dict[str, Any]],
+    card_width: int
+) -> list[dict[str, Any]]:
     """
-    Retry OCR inside one dynamically calculated card region.
+    Retry a team card progressively until enough rows are recovered.
     """
 
-    region = anchor["region"]
+    region = anchor[
+        "region"
+    ]
 
-    x_left = region["x_left"]
-    x_right = region["x_right"]
-    y_top = region["y_top"]
-    y_bottom = region["y_bottom"]
+    x_left = region[
+        "x_left"
+    ]
+
+    x_right = region[
+        "x_right"
+    ]
+
+    y_top = region[
+        "y_top"
+    ]
+
+    y_bottom = region[
+        "y_bottom"
+    ]
 
     image_region = source_image[
         y_top:y_bottom,
@@ -1770,29 +2333,64 @@ def retry_team_region(
     ]
 
     if image_region.size == 0:
-        return
+        return []
 
-    for pass_name, variant in create_retry_variants(
-        image_region
+    players = extract_players_for_team(
+        anchor,
+        ocr_items,
+        card_width
+    )
+
+    for variant_name, variant in (
+        generate_retry_variants(
+            image_region,
+            MAX_PLAYER_RETRY_VARIANTS
+        )
     ):
-        retry_results = reader.readtext(
+        if (
+            len(
+                players
+            )
+            >= EXPECTED_PLAYERS_PER_TEAM
+        ):
+            break
+
+        log(
+            f"Retrying player rows for "
+            f"{anchor['team']} "
+            f"using {variant_name}."
+        )
+
+        retry_results = run_ocr(
+            reader,
             variant,
-            detail=1,
-            paragraph=False,
-            text_threshold=0.45,
-            low_text=0.25,
-            link_threshold=0.25,
-            contrast_ths=0.05,
-            adjust_contrast=0.70
+            (
+                "player-rows-"
+                + variant_name
+            )
         )
 
         append_raw_ocr_results(
             ocr_items=ocr_items,
             raw_results=retry_results,
-            pass_name=pass_name,
+            pass_name=(
+                "player-rows-"
+                + variant_name
+            ),
             x_offset=x_left,
             y_offset=y_top
         )
+
+        players = extract_players_for_team(
+            anchor,
+            ocr_items,
+            card_width
+        )
+
+        del retry_results
+        gc.collect()
+
+    return players
 
 
 # ============================================================
@@ -1804,22 +2402,12 @@ def parse_scoreboard(
     include_debug: bool = False
 ) -> dict[str, Any]:
     """
-    Process one scoreboard screenshot and return structured JSON data.
-
-    Parameters
-    ----------
-    image_path_value:
-        Full or relative path to the uploaded screenshot.
-
-    include_debug:
-        Include OCR coordinates and calculated card regions in the
-        returned JSON. Keep this False for normal API use.
-
-    Returns
-    -------
-    dict:
-        Structured scoreboard data.
+    Process one scoreboard screenshot and return structured JSON.
     """
+
+    parser_started_at = (
+        time.perf_counter()
+    )
 
     image_path = Path(
         image_path_value
@@ -1827,7 +2415,8 @@ def parse_scoreboard(
 
     if not image_path.exists():
         raise FileNotFoundError(
-            f"Could not find '{image_path_value}'."
+            f"Could not find "
+            f"'{image_path_value}'."
         )
 
     image = cv2.imread(
@@ -1838,32 +2427,38 @@ def parse_scoreboard(
 
     if image is None:
         raise ValueError(
-            f"OpenCV could not read '{image_path_value}'. "
-            f"Confirm that it is a valid image file."
+            "OpenCV could not read "
+            "the uploaded image."
         )
 
-    image = cv2.resize(
-        image,
-        None,
-        fx=UPSCALE_FACTOR,
-        fy=UPSCALE_FACTOR,
-        interpolation=cv2.INTER_CUBIC
+    original_height, original_width = (
+        image.shape[:2]
+    )
+
+    image, scale_factor = (
+        resize_image_safely(
+            image
+        )
     )
 
     image_height, image_width = (
         image.shape[:2]
     )
 
-    print(
-        "Starting full-image OCR..."
+    log(
+        f"Processing image "
+        f"{original_width}x{original_height}; "
+        f"working size "
+        f"{image_width}x{image_height}; "
+        f"scale factor={scale_factor}."
     )
 
     reader = get_ocr_reader()
 
-    raw_results = reader.readtext(
+    raw_results = run_ocr(
+        reader,
         image,
-        detail=1,
-        paragraph=False
+        "full-image"
     )
 
     ocr_items = []
@@ -1871,99 +2466,110 @@ def parse_scoreboard(
     append_raw_ocr_results(
         ocr_items=ocr_items,
         raw_results=raw_results,
-        pass_name="full_image"
+        pass_name="full-image"
     )
 
-    # ========================================================
-    # DETECT TEAM HEADINGS
-    # ========================================================
+    del raw_results
+
+    gc.collect()
 
     team_anchors = []
 
     for item in ocr_items:
-        corrected_team = normalise_team_heading(
-            item["text"]
+        normalised_team = (
+            normalise_team_heading(
+                item[
+                    "text"
+                ]
+            )
         )
 
-        if corrected_team is None:
+        if normalised_team is None:
             continue
 
         team_anchors.append({
-            "team": corrected_team,
-            "original_team_ocr_text": item["text"],
-            "team_heading_confidence": item[
-                "confidence"
+            "team": normalised_team,
+            "original_team_ocr_text": (
+                item[
+                    "text"
+                ]
+            ),
+            "team_heading_confidence": (
+                item[
+                    "confidence"
+                ]
+            ),
+            "x_centre": item[
+                "x_centre"
             ],
-            "x_centre": item["x_centre"],
-            "y_centre": item["y_centre"],
+            "y_centre": item[
+                "y_centre"
+            ],
             "header_refined": False
         })
 
-    team_anchors = remove_duplicate_team_anchors(
-        team_anchors
+    team_anchors = (
+        remove_duplicate_team_anchors(
+            team_anchors
+        )
     )
 
     if not team_anchors:
         raise ValueError(
             "No team headings were detected. "
-            "Try a clearer screenshot or increase UPSCALE_FACTOR."
+            "Try a clearer screenshot."
         )
 
-    print(
-        f"Detected {len(team_anchors)} team heading(s) "
-        f"during the initial OCR pass."
+    log(
+        f"Detected {len(team_anchors)} "
+        f"heading(s) during the "
+        f"full-image pass."
     )
 
-    # ========================================================
-    # REFINE TEAM HEADINGS
-    # ========================================================
-
-    team_anchors = refine_detected_team_headers(
-        team_anchors=team_anchors,
-        reader=reader,
-        source_image=image,
-        image_width=image_width
+    team_anchors = (
+        refine_uncertain_team_headers(
+            team_anchors=team_anchors,
+            reader=reader,
+            source_image=image,
+            image_width=image_width
+        )
     )
 
-    team_anchors = remove_duplicate_team_anchors(
-        team_anchors
+    team_anchors = (
+        remove_duplicate_team_anchors(
+            team_anchors
+        )
     )
 
-    # ========================================================
-    # RECOVER MISSING TEAM CARDS
-    # ========================================================
-
-    team_anchors = recover_missing_team_headers(
-        team_anchors=team_anchors,
-        reader=reader,
-        source_image=image,
-        ocr_items=ocr_items,
-        image_width=image_width
+    team_anchors = (
+        recover_missing_team_headers(
+            team_anchors=team_anchors,
+            reader=reader,
+            source_image=image,
+            ocr_items=ocr_items,
+            image_width=image_width
+        )
     )
 
-    team_anchors = remove_duplicate_team_anchors(
-        team_anchors
+    team_anchors = (
+        remove_duplicate_team_anchors(
+            team_anchors
+        )
     )
 
-    print(
-        f"Using {len(team_anchors)} team heading(s) "
-        f"after missing-card recovery."
+    log(
+        f"Using {len(team_anchors)} "
+        f"heading(s) after recovery."
     )
 
-    # ========================================================
-    # BUILD DYNAMIC TEAM REGIONS
-    # ========================================================
-
-    team_regions, estimated_card_width = build_team_regions(
-        team_anchors=team_anchors,
-        ocr_items=ocr_items,
-        image_width=image_width,
-        image_height=image_height
+    team_regions, estimated_card_width = (
+        build_team_regions(
+            team_anchors=team_anchors,
+            ocr_items=ocr_items,
+            image_width=image_width,
+            image_height=image_height
+        )
     )
-
-    # ========================================================
-    # EXTRACT PLAYER ROWS
-    # ========================================================
 
     structured_teams = []
 
@@ -1986,31 +2592,17 @@ def parse_scoreboard(
         ):
             dynamic_retry_used = True
 
-            print(
-                f"Retrying OCR for {anchor['team']} "
-                f"because only {initial_player_count} "
-                f"player row(s) were detected..."
+            players = (
+                retry_missing_player_rows(
+                    anchor=anchor,
+                    reader=reader,
+                    source_image=image,
+                    ocr_items=ocr_items,
+                    card_width=(
+                        estimated_card_width
+                    )
+                )
             )
-
-            retry_team_region(
-                anchor=anchor,
-                reader=reader,
-                source_image=image,
-                ocr_items=ocr_items
-            )
-
-            players = extract_players_for_team(
-                anchor=anchor,
-                ocr_items=ocr_items,
-                card_width=estimated_card_width
-            )
-
-        row_count_warning = (
-            len(
-                players
-            )
-            < EXPECTED_PLAYERS_PER_TEAM
-        )
 
         structured_teams.append({
             "placement": anchor[
@@ -2022,25 +2614,35 @@ def parse_scoreboard(
             "team": anchor[
                 "team"
             ],
-            "original_team_ocr_text": anchor.get(
-                "original_team_ocr_text",
-                ""
+            "original_team_ocr_text": (
+                anchor.get(
+                    "original_team_ocr_text",
+                    ""
+                )
             ),
-            "team_heading_confidence": anchor.get(
-                "team_heading_confidence",
-                0.0
+            "team_heading_confidence": (
+                anchor.get(
+                    "team_heading_confidence",
+                    0.0
+                )
             ),
-            "team_name_needs_review": anchor.get(
-                "team_name_needs_review",
-                False
+            "team_name_needs_review": (
+                anchor.get(
+                    "team_name_needs_review",
+                    False
+                )
             ),
-            "header_refined": anchor.get(
-                "header_refined",
-                False
+            "header_refined": (
+                anchor.get(
+                    "header_refined",
+                    False
+                )
             ),
-            "recovered_from_missing_grid_position": anchor.get(
-                "recovered_from_missing_grid_position",
-                False
+            "recovered_from_missing_grid_position": (
+                anchor.get(
+                    "recovered_from_missing_grid_position",
+                    False
+                )
             ),
             "initial_player_count": (
                 initial_player_count
@@ -2055,7 +2657,10 @@ def parse_scoreboard(
                 dynamic_retry_used
             ),
             "row_count_warning": (
-                row_count_warning
+                len(
+                    players
+                )
+                < EXPECTED_PLAYERS_PER_TEAM
             ),
             "players": players
         })
@@ -2063,22 +2668,45 @@ def parse_scoreboard(
     structured_teams = sorted(
         structured_teams,
         key=lambda team: (
-            team["placement"] is None,
-            (
-                team["placement"]
-                if team["placement"] is not None
-                else 999
-            )
+            team[
+                "placement"
+            ]
+            is None,
+            team[
+                "placement"
+            ]
+            if team[
+                "placement"
+            ]
+            is not None
+            else 999
         )
     )
 
+    elapsed_seconds = round(
+        time.perf_counter()
+        - parser_started_at,
+        2
+    )
+
     output = {
-        "source_image": image_path.name,
-        "image_width_after_upscaling": (
+        "source_image": (
+            image_path.name
+        ),
+        "original_image_width": (
+            original_width
+        ),
+        "original_image_height": (
+            original_height
+        ),
+        "working_image_width": (
             image_width
         ),
-        "image_height_after_upscaling": (
+        "working_image_height": (
             image_height
+        ),
+        "scale_factor": (
+            scale_factor
         ),
         "estimated_card_width": (
             estimated_card_width
@@ -2086,11 +2714,19 @@ def parse_scoreboard(
         "detected_team_count": len(
             structured_teams
         ),
+        "processing_seconds": (
+            elapsed_seconds
+        ),
+        "cpu_thread_limit": (
+            CPU_THREAD_LIMIT
+        ),
         "teams": structured_teams
     }
 
     if include_debug:
-        output["debug"] = {
+        output[
+            "debug"
+        ] = {
             "detected_team_regions": (
                 team_regions
             ),
@@ -2098,5 +2734,14 @@ def parse_scoreboard(
                 ocr_items
             )
         }
+
+    log(
+        f"Completed scoreboard parsing "
+        f"in {elapsed_seconds}s."
+    )
+
+    del image
+
+    gc.collect()
 
     return output
